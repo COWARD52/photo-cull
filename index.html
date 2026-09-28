@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="本地运行的照片初筛工具：检测模糊、曝光异常和相似连拍，帮助快速挑出值得保留的照片。" />
+  <title>拣片 · 照片初筛台</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23101317'/%3E%3Cpath d='M18 21h8l3-4h7l3 4h7a5 5 0 0 1 5 5v20a5 5 0 0 1-5 5H18a5 5 0 0 1-5-5V26a5 5 0 0 1 5-5Z' fill='none' stroke='%23eaff68' stroke-width='4'/%3E%3Ccircle cx='32' cy='35' r='9' fill='%23eaff68'/%3E%3Cpath d='m28 35 3 3 6-7' fill='none' stroke='%23101317' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#" aria-label="拣片首页">
+      <span class="brand-mark" aria-hidden="true">◉</span>
+      <span>拣片</span>
+      <span class="brand-sub">照片初筛台</span>
+    </a>
+    <div class="privacy-pill"><span aria-hidden="true">●</span> 照片只在本机处理</div>
+  </header>
+
+  <main>
+    <section id="emptyView" class="empty-view">
+      <div class="intro">
+        <p class="eyebrow">把挑照片从一小时，缩到十分钟</p>
+        <h1>先让算法挑一遍，<br /><span>你只做最后决定。</span></h1>
+        <p class="lead">一次选择一组连拍。拣片会检测模糊、过曝、欠曝和高度相似照片，并把更值得保留的排在前面。</p>
+        <div class="intro-actions">
+          <button class="primary-btn" id="pickBtn">选择照片</button>
+          <span>支持 JPG、PNG、WebP · 可一次多选</span>
+        </div>
+      </div>
+
+      <button class="dropzone" id="dropzone" type="button">
+        <span class="drop-icon" aria-hidden="true">
+          <svg viewBox="0 0 48 48"><path d="M10 13h9l3-4h7l3 4h6a6 6 0 0 1 6 6v19a6 6 0 0 1-6 6H10a6 6 0 0 1-6-6V19a6 6 0 0 1 6-6Z"/><circle cx="24" cy="28" r="9"/><path d="M24 24v8m-4-4h8"/></svg>
+        </span>
+        <strong>把照片拖到这里</strong>
+        <span>原图不会离开你的设备</span>
+      </button>
+
+      <div class="how-it-works" aria-label="筛选步骤">
+        <div><span>01</span><strong>批量导入</strong><small>一次选中整组连拍</small></div>
+        <div><span>02</span><strong>自动初筛</strong><small>清晰度、曝光、相似度</small></div>
+        <div><span>03</span><strong>快速复核</strong><small>按键保留或淘汰</small></div>
+      </div>
+    </section>
+
+    <section id="workspace" class="workspace" hidden>
+      <aside class="sidebar">
+        <div class="side-title">
+          <p>本次筛选</p>
+          <button id="addMoreBtn" class="text-btn">＋ 添加照片</button>
+        </div>
+        <nav class="filters" aria-label="筛选结果">
+          <button class="filter active" data-filter="all"><span>全部照片</span><b id="countAll">0</b></button>
+          <button class="filter" data-filter="best"><span><i class="dot lime"></i>推荐保留</span><b id="countBest">0</b></button>
+          <button class="filter" data-filter="review"><span><i class="dot amber"></i>待你确认</span><b id="countReview">0</b></button>
+          <button class="filter" data-filter="reject"><span><i class="dot coral"></i>建议淘汰</span><b id="countReject">0</b></button>
+          <button class="filter" data-filter="kept"><span>你已保留</span><b id="countKept">0</b></button>
+        </nav>
+        <div class="side-note">
+          <strong>不会自动删除</strong>
+          <p>所有判断只是建议。原始文件始终保留在原处。</p>
+        </div>
+      </aside>
+
+      <div class="main-panel">
+        <div class="workspace-head">
+          <div>
+            <p class="eyebrow" id="viewEyebrow">全部照片</p>
+            <h2 id="viewTitle">正在分析…</h2>
+          </div>
+          <div class="head-actions">
+            <label class="threshold-control">严格度
+              <input id="strictness" type="range" min="0" max="2" value="1" step="1" aria-label="筛选严格度" />
+            </label>
+            <button class="secondary-btn" id="exportBtn">导出清单</button>
+          </div>
+        </div>
+
+        <div class="progress-wrap" id="progressWrap">
+          <div class="progress-meta"><span id="progressText">准备分析</span><span id="progressPercent">0%</span></div>
+          <div class="progress-track"><span id="progressBar"></span></div>
+        </div>
+
+        <div class="summary" id="summary" hidden>
+          <div><span id="summaryBest">0</span><small>推荐保留</small></div>
+          <div><span id="summaryDuplicates">0</span><small>相似照片</small></div>
+          <div><span id="summaryIssues">0</span><small>质量问题</small></div>
+          <p id="summaryCopy">分析完成，可以开始复核。</p>
+        </div>
+
+        <div class="gallery" id="gallery" aria-live="polite"></div>
+        <div class="no-results" id="noResults" hidden>这个分类里暂时没有照片。</div>
+      </div>
+    </section>
+  </main>
+
+  <input id="fileInput" type="file" accept="image/jpeg,image/png,image/webp" multiple hidden />
+
+  <dialog id="viewer" class="viewer">
+    <button class="viewer-close" id="viewerClose" aria-label="关闭预览">×</button>
+    <div class="viewer-image-wrap"><img id="viewerImage" alt="照片预览" /></div>
+    <div class="viewer-info">
+      <div><p id="viewerStatus" class="status-label"></p><h3 id="viewerName"></h3><p id="viewerReason"></p></div>
+      <div class="viewer-score"><span id="viewerScore">0</span><small>综合分</small></div>
+    </div>
+    <div class="viewer-actions">
+      <button id="viewerReject" class="reject-btn">D · 淘汰</button>
+      <span>← → 切换照片</span>
+      <button id="viewerKeep" class="keep-btn">K · 保留</button>
+    </div>
+  </dialog>
+
+  <canvas id="analysisCanvas" hidden></canvas>
+  <script src="app.js"></script>
+</body>
+</html>

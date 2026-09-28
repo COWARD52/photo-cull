@@ -1,0 +1,8 @@
+{
+  "name": "jianpian-photo-sorter",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "mkdir -p dist/.openai && cp index.html styles.css app.js dist/ && cp .openai/hosting.json dist/.openai/hosting.json"
+  }
+}
