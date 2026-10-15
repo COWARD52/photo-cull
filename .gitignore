@@ -1,2 +1,9 @@
 dist/
 .DS_Store
+iOS/拣片/build/
+iOS/拣片/输出/
+iOS/拣片/拣片.xcodeproj/xcuserdata/
+iOS/拣片/拣片.xcodeproj/project.xcworkspace/xcuserdata/
+tools/__pycache__/
+tools/.photo_cull_vision
+tools/.venv/
