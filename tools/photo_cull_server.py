@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import os
+import tempfile
 import platform
 import re
 import shutil
@@ -19,6 +22,8 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from itertools import combinations
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 
 CATEGORY_DIRS = {
@@ -29,6 +34,157 @@ CATEGORY_DIRS = {
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
 RAW_EXTENSIONS = {".arw", ".cr2", ".cr3", ".nef", ".nrw", ".raf", ".dng", ".rw2", ".orf", ".pef", ".srw", ".raw"}
 GROUP_FEEDBACK_FILE = "相似分组反馈.json"
+
+
+def ai_photo_advice(report_dir: Path, names: list[str], supplied_key: str = "", mode: str = "api",
+                    model: str = "", base_url: str = "") -> dict:
+    """Analyze only explicitly selected report previews; never change decisions."""
+    if mode not in {"api", "compatible", "codex"}:
+        raise ValueError("不支持的模型接入方式")
+    if not isinstance(names, list) or not 1 <= len(names) <= 6 or any(not isinstance(name, str) for name in names):
+        raise ValueError("请选择 1–6 张照片进行分析")
+    data = json.loads((report_dir / "初筛数据.json").read_text(encoding="utf-8"))
+    by_name = {item["name"]: item for item in data.get("photos", [])}
+    if len(set(names)) != len(names) or any(name not in by_name for name in names):
+        raise ValueError("选择的照片不在当前报告中")
+    prompt = (
+        "你是摄影选片助手。请用中文分析这些照片，结合画面内容、构图、光线、主体、情绪和重复度给出筛选建议。"
+        "先给明确结论（单张：保留/待确认/淘汰；多张：优先保留哪张，其他如何处理），再给每张最多两点可见证据，"
+        "最后说明你看不清或无法判断的地方。不要把已有算法分数当成事实，不要编造画面细节。"
+        "建议只供人工参考，禁止代替用户做决定。以下是文件名及本地初筛参考：\n" +
+        "\n".join(f"{name}：{by_name[name].get('score', '—')}分；{by_name[name].get('reason', '')}" for name in names)
+    )
+    content = [{"type": "input_text", "text": prompt}]
+    previews = []
+    for name in names:
+        thumb = by_name[name].get("thumb", "")
+        preview = (report_dir / thumb).resolve()
+        if not thumb.startswith("thumbs/") or not preview.is_relative_to(report_dir.resolve()) or not preview.is_file():
+            raise ValueError(f"{name} 的预览图不可用")
+        previews.append(preview)
+        if mode == "codex":
+            continue
+        image = base64.b64encode(preview.read_bytes()).decode("ascii")
+        content.append({"type": "input_text", "text": f"照片：{name}"})
+        content.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{image}", "detail": "high"})
+    if mode == "codex":
+        executable = shutil.which("codex")
+        if executable is None:
+            local_cli = Path.home() / ".local" / "bin" / "codex"
+            executable = str(local_cli) if local_cli.is_file() else None
+        if executable is None:
+            raise ValueError("未找到 Codex CLI。请先安装并运行 codex login。")
+        env = os.environ.copy()
+        for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL"):
+            env.pop(key, None)
+        with tempfile.TemporaryDirectory(prefix="photo-cull-ai-") as workspace:
+            command = [executable, "exec", "--sandbox", "read-only", "--skip-git-repo-check",
+                       "--ignore-rules", "--ephemeral", "--json", "-C", workspace]
+            if model and model != "default":
+                command += ["--model", model]
+            for preview in previews:
+                command += ["--image", str(preview)]
+            command += ["--", prompt]
+            try:
+                result = subprocess.run(command, cwd=workspace, env=env, capture_output=True,
+                                        text=True, timeout=120, check=False)
+            except subprocess.TimeoutExpired:
+                raise ValueError("Codex CLI 分析超时，请检查登录和网络状态") from None
+        if result.returncode:
+            raise ValueError(f"Codex CLI 分析失败：{(result.stderr or result.stdout)[-300:]}")
+        messages = []
+        for line in result.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message":
+                messages.append(event["item"].get("text", ""))
+        advice = messages[-1].strip() if messages else ""
+        if not advice:
+            raise ValueError("Codex CLI 没有返回可显示的建议")
+        return {"advice": advice, "model": model or "Codex 默认模型", "names": names}
+    api_key = (os.environ.get("OPENAI_API_KEY", "") if mode == "api" else "") or supplied_key
+    api_key = api_key.strip()
+    if not api_key:
+        raise ValueError("请填写 OpenAI API Key，或在启动本地服务前设置 OPENAI_API_KEY。")
+    model = model.strip() or (os.environ.get("PHOTO_CULL_AI_MODEL", "gpt-6-luna") if mode == "api" else "")
+    if not model:
+        raise ValueError("请填写支持图片输入的模型 ID")
+    if mode == "compatible":
+        parsed = urlparse(base_url.rstrip("/"))
+        if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}):
+            raise ValueError("供应商地址必须是 HTTPS，或本机 HTTP 地址")
+        if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("供应商地址无效")
+        chat_content = [{"type": "text", "text": part["text"]} if part["type"] == "input_text"
+                        else {"type": "image_url", "image_url": {"url": part["image_url"]}}
+                        for part in content]
+        body = json.dumps({"model": model, "messages": [{"role": "user", "content": chat_content}],
+                           "max_tokens": 600}, ensure_ascii=False).encode("utf-8")
+        endpoint = base_url.rstrip("/") + "/chat/completions"
+    else:
+        body = json.dumps({"model": model, "input": [{"role": "user", "content": content}],
+                           "max_output_tokens": 600, "store": False,
+                           **({"reasoning": {"effort": "none"}} if model == "gpt-6-luna" else {})}, ensure_ascii=False).encode("utf-8")
+        endpoint = "https://api.openai.com/v1/responses"
+    request = Request(endpoint, data=body,
+                      headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+    try:
+        with urlopen(request, timeout=60) as response:
+            result = json.load(response)
+    except HTTPError as exc:
+        try:
+            detail = json.load(exc).get("error", {}).get("message", "")
+        except Exception:
+            detail = ""
+        raise ValueError(f"OpenAI 请求失败（HTTP {exc.code}）：{detail[:180]}") from None
+    except URLError as exc:
+        raise ValueError(f"连接 OpenAI 失败：{exc.reason}") from None
+    if mode == "compatible":
+        choices = result.get("choices", [])
+        advice = str(choices[0].get("message", {}).get("content", "")).strip() if choices else ""
+    else:
+        advice = "\n".join(part.get("text", "") for item in result.get("output", [])
+                           for part in item.get("content", []) if part.get("type") == "output_text").strip()
+    if not advice:
+        raise ValueError("模型没有返回可显示的建议，请重试")
+    return {"advice": advice, "model": model, "names": names}
+
+
+def test_ai_connection(mode: str, supplied_key: str = "", base_url: str = "") -> str:
+    if mode == "codex":
+        executable = shutil.which("codex") or str(Path.home() / ".local" / "bin" / "codex")
+        if not Path(executable).is_file():
+            raise ValueError("未找到 Codex CLI")
+        result = subprocess.run([executable, "login", "status"], capture_output=True, text=True, timeout=15)
+        if result.returncode:
+            raise ValueError("Codex CLI 尚未登录，请先运行 codex login")
+        return result.stdout.strip() or "Codex CLI 已登录"
+    if mode not in {"api", "compatible"}:
+        raise ValueError("不支持的模型接入方式")
+    api_key = ((os.environ.get("OPENAI_API_KEY", "") if mode == "api" else "") or supplied_key).strip()
+    if not api_key:
+        raise ValueError("请先填写 API Key")
+    if mode == "api":
+        endpoint = "https://api.openai.com/v1/models"
+    else:
+        parsed = urlparse(base_url.rstrip("/"))
+        if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}):
+            raise ValueError("供应商地址必须是 HTTPS，或本机 HTTP 地址")
+        if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("供应商地址无效")
+        endpoint = base_url.rstrip("/") + "/models"
+    request = Request(endpoint, headers={"Authorization": f"Bearer {api_key}"})
+    try:
+        with urlopen(request, timeout=15) as response:
+            if response.status != 200:
+                raise ValueError(f"连接测试失败（HTTP {response.status}）")
+    except HTTPError as exc:
+        raise ValueError(f"连接测试失败（HTTP {exc.code}）") from None
+    except URLError as exc:
+        raise ValueError(f"连接测试失败：{exc.reason}") from None
+    return "连接成功。图片模型是否可用，请手动分析一张照片确认。"
 
 
 def choose_photo_directory() -> Path | None:
@@ -329,7 +485,7 @@ def make_handler(report_dir: Path, source_dir: Path):
 
         def do_POST(self) -> None:
             route = urlparse(self.path).path
-            if route not in {"/api/organize", "/api/undo", "/api/decisions", "/api/group-feedback", "/api/switch-directory"}:
+            if route not in {"/api/organize", "/api/undo", "/api/decisions", "/api/group-feedback", "/api/switch-directory", "/api/ai-advice", "/api/ai-test"}:
                 self.send_json(404, {"ok": False, "error": "接口不存在"})
                 return
             try:
@@ -337,7 +493,11 @@ def make_handler(report_dir: Path, source_dir: Path):
                 if length <= 0 or length > 2_000_000:
                     raise ValueError("请求大小异常")
                 payload = json.loads(self.rfile.read(length))
-                if route == "/api/switch-directory":
+                if route == "/api/ai-advice":
+                    self.send_json(200, {"ok": True, **ai_photo_advice(report_dir, payload.get("names"), payload.get("api_key", ""), payload.get("mode", "api"), payload.get("model", ""), payload.get("base_url", ""))})
+                elif route == "/api/ai-test":
+                    self.send_json(200, {"ok": True, "message": test_ai_connection(payload.get("mode", "api"), payload.get("api_key", ""), payload.get("base_url", ""))})
+                elif route == "/api/switch-directory":
                     selected = choose_photo_directory()
                     if selected is None:
                         self.send_json(200, {"ok": True, "cancelled": True})

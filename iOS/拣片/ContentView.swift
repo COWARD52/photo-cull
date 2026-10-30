@@ -1,5 +1,6 @@
 import SwiftUI
 import Photos
+import Security
 
 struct ContentView: View {
     @EnvironmentObject private var library: PhotoLibraryStore
@@ -9,6 +10,7 @@ struct ContentView: View {
     @State private var showOrganizeConfirmation = false
     @State private var isOrganizing = false
     @State private var presentedScreen: ReviewScreen?
+    @State private var aiRequest: AIRequest?
 
     private enum ReviewScreen: Identifiable {
         case photo(ScoredPhoto)
@@ -26,6 +28,11 @@ struct ContentView: View {
         case albums
         case guide
         var id: String { rawValue }
+    }
+
+    private struct AIRequest: Identifiable {
+        let id = UUID()
+        let photos: [ScoredPhoto]
     }
 
     private let albumColumns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
@@ -63,6 +70,9 @@ struct ContentView: View {
                 case .albums: albumSheet
                 case .guide: guideSheet
                 }
+            }
+            .sheet(item: $aiRequest) { request in
+                AIAdviceView(photos: request.photos)
             }
             .fullScreenCover(item: $presentedScreen) { screen in
                 switch screen {
@@ -112,13 +122,13 @@ struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("照片只在你的 iPhone 上分析")
+                    Text("基础分析在 iPhone 上完成")
                         .font(.system(size: 13, weight: .semibold, design: .rounded))
                         .foregroundStyle(Color.limeAccent)
                     Text("拍得多，也能更快挑出\n值得留下的照片。")
                         .font(.system(size: 34, weight: .bold, design: .rounded))
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("选择一个相册，拾片会检查清晰度、曝光和相似照片。所有判断都可以手动调整。")
+                    Text("选择一个相册，拾片会检查清晰度、曝光和相似照片。拿不准时可主动请求 AI 建议，所有判断都可以手动调整。")
                         .font(.subheadline)
                         .foregroundStyle(.white.opacity(0.64))
                         .lineSpacing(4)
@@ -158,8 +168,8 @@ struct ContentView: View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: "lock.shield.fill").foregroundStyle(Color.limeAccent).font(.title3)
             VStack(alignment: .leading, spacing: 4) {
-                Text("本机处理，不上传照片").font(.subheadline.bold())
-                Text("结果只会在你确认后写入系统相册。淘汰照片不会被自动删除。")
+                Text("基础分析在本机完成").font(.subheadline.bold())
+                Text("只有你主动使用 AI 建议时，所选照片的预览图才会发送到 OpenAI。淘汰照片不会被自动删除。")
                     .font(.caption).foregroundStyle(.white.opacity(0.58))
             }
         }
@@ -354,6 +364,13 @@ struct ContentView: View {
                         }
                     }
                 }
+                Button { aiRequest = AIRequest(photos: [photo]) } label: {
+                    Label("AI 帮我看看", systemImage: "sparkles")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(maxWidth: .infinity).padding(.vertical, 8)
+                        .foregroundStyle(Color.limeAccent)
+                        .background(Color.limeAccent.opacity(0.09), in: RoundedRectangle(cornerRadius: 8))
+                }
             }
             .padding(.horizontal, 9).padding(.bottom, 9)
         }
@@ -418,7 +435,7 @@ struct ContentView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     guideRow("1", title: "选择相册", detail: "拾片会在本机读取照片，检查清晰度、曝光和相似照片。")
-                    guideRow("2", title: "逐张调整", detail: "把照片设为保留、待确认或淘汰；相似组也可以一起比较和调整。")
+                    guideRow("2", title: "逐张调整", detail: "把照片设为保留、待确认或淘汰；拿不准时可手动请求 AI 分析单张或对比组。")
                     guideRow("3", title: "确认整理", detail: "待确认和待删除会归入对应系统相册，方便你之后复核。")
                     Label("不会自动删除原片；最终删除由你在系统照片 App 中确认。", systemImage: "lock.shield")
                         .font(.footnote).foregroundStyle(.secondary)
@@ -467,6 +484,7 @@ private struct GroupComparisonView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var selectedIndex = 0
     @State private var previewPhoto: ScoredPhoto?
+    @State private var showAIAdvice = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -477,6 +495,9 @@ private struct GroupComparisonView: View {
                         .font(.caption).foregroundStyle(.white.opacity(0.58))
                 }
                 Spacer()
+                Button("AI 帮我选") { showAIAdvice = true }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.limeAccent)
                 Button("完成") { dismiss() }
                     .font(.subheadline.weight(.semibold))
                     .padding(.horizontal, 14).padding(.vertical, 9)
@@ -504,6 +525,9 @@ private struct GroupComparisonView: View {
         .preferredColorScheme(.dark)
         .fullScreenCover(item: $previewPhoto) { photo in
             PhotoPreviewView(photo: photo)
+        }
+        .sheet(isPresented: $showAIAdvice) {
+            AIAdviceView(photos: Array(photos.sorted { $0.groupRank < $1.groupRank }.prefix(6)))
         }
     }
 
@@ -683,4 +707,131 @@ private struct AlbumThumbnail: View {
 
 private extension Color {
     static let limeAccent = Color(red: 0.83, green: 0.98, blue: 0.31)
+}
+
+private enum AIKeyStore {
+    private static let account = "openai-api-key"
+
+    static func load() -> String {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: "jianpian.ai",
+                                    kSecAttrAccount as String: account,
+                                    kSecReturnData as String: true,
+                                    kSecMatchLimit as String: kSecMatchLimitOne]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return "" }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    static func save(_ key: String) -> Bool {
+        let identity: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                       kSecAttrService as String: "jianpian.ai",
+                                       kSecAttrAccount as String: account]
+        SecItemDelete(identity as CFDictionary)
+        guard !key.isEmpty else { return true }
+        var item = identity
+        item[kSecValueData as String] = Data(key.utf8)
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+    }
+}
+
+private struct AIAdviceView: View {
+    let photos: [ScoredPhoto]
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var library: PhotoLibraryStore
+    @State private var apiKey = AIKeyStore.load()
+    @State private var advice = ""
+    @State private var error = ""
+    @State private var isLoading = false
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text(photos.count == 1 ? "让 AI 看看这张" : "让 AI 比较这 \(photos.count) 张")
+                        .font(.title2.bold())
+                    Text("仅在你点击下方按钮后，才发送所选照片的压缩预览图到 OpenAI。不会发送 RAW 或整本相册，也不会自动改动筛选结果。调用可能产生 API 费用。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    SecureField("OpenAI API Key（sk-…）", text: $apiKey)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .textContentType(.password)
+                        .padding(12)
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                    Text("密钥只保存在这台 iPhone 的钥匙串中；ChatGPT 订阅不能代替 API Key。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button {
+                        Task { await analyze() }
+                    } label: {
+                        Label(isLoading ? "正在分析…" : "发送预览图并获取建议", systemImage: "sparkles")
+                            .frame(maxWidth: .infinity).padding(14)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isLoading)
+                    if isLoading { ProgressView("正在查看画面与比较差异…") }
+                    if !error.isEmpty { Text(error).foregroundStyle(.orange).font(.footnote) }
+                    if !advice.isEmpty {
+                        Text(advice)
+                            .font(.body)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(16)
+                            .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
+                    }
+                }
+                .padding(20)
+            }
+            .navigationTitle("AI 选片建议")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } } }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    @MainActor
+    private func analyze() async {
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard AIKeyStore.save(key) else { error = "密钥保存失败，请重试。"; return }
+        error = ""
+        advice = ""
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            var content: [[String: Any]] = [["type": "input_text", "text":
+                "你是摄影选片助手。请用中文给出明确但谨慎的筛选建议。单张建议保留/待确认/淘汰；多张指出最值得保留的一张和其他照片的去留。"
+                + "结合主体、构图、光线、情绪、清晰度和重复度说明可见证据；不能判断的地方要指出。已有分数只作参考，不要编造细节。建议不代替用户决定。"]]
+            for photo in photos.prefix(6) {
+                guard let image = await library.thumbnail(for: photo.asset, size: CGSize(width: 1200, height: 1200)),
+                      let data = image.jpegData(compressionQuality: 0.78) else {
+                    throw NSError(domain: "AIAdvice", code: 1, userInfo: [NSLocalizedDescriptionKey: "无法读取 \(photo.filename) 的预览图"])
+                }
+                content.append(["type": "input_text", "text": "\(photo.filename)：本地评分 \(photo.score)，当前 \(photo.decision.title)；\(photo.reason)"])
+                content.append(["type": "input_image", "image_url": "data:image/jpeg;base64,\(data.base64EncodedString())", "detail": "high"])
+            }
+            let body: [String: Any] = ["model": "gpt-6-luna", "input": [["role": "user", "content": content]],
+                                       "max_output_tokens": 600, "store": false,
+                                       "reasoning": ["effort": "none"]]
+            var request = URLRequest(url: URL(string: "https://api.openai.com/v1/responses")!)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            request.timeoutInterval = 60
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                let detail = (json["error"] as? [String: Any])?["message"] as? String ?? "请求失败"
+                throw NSError(domain: "AIAdvice", code: 2, userInfo: [NSLocalizedDescriptionKey: detail])
+            }
+            let output = json["output"] as? [[String: Any]] ?? []
+            let text = output.flatMap { $0["content"] as? [[String: Any]] ?? [] }
+                .compactMap { $0["text"] as? String }.joined(separator: "\n")
+            guard !text.isEmpty else { throw NSError(domain: "AIAdvice", code: 3, userInfo: [NSLocalizedDescriptionKey: "模型没有返回可显示的建议"])}
+            advice = text
+        } catch {
+            self.error = "暂时无法获取建议：\(error.localizedDescription)"
+        }
+    }
 }

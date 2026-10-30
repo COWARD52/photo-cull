@@ -36,7 +36,36 @@ fi
 
 report_dir="$photo_dir/_初筛结果"
 
-selected_mode="$(osascript <<'APPLESCRIPT'
+resume_existing=false
+if [[ -f "$report_dir/初筛数据.json" ]]; then
+  selected_action="$(osascript <<'APPLESCRIPT'
+set choices to {"继续上次筛选（直接打开）", "重新分析这批照片"}
+set picked to choose from list choices with prompt "找到这个文件夹之前的筛选结果" default items {"继续上次筛选（直接打开）"}
+if picked is false then return "cancel"
+if item 1 of picked is "重新分析这批照片" then return "analyze"
+return "resume"
+APPLESCRIPT
+)"
+  if [[ "$selected_action" == "cancel" ]]; then
+    echo "已取消启动。"
+    exit 0
+  fi
+  [[ "$selected_action" == "resume" ]] && resume_existing=true
+fi
+
+if $resume_existing; then
+  echo "正在恢复已有筛选结果，不重新分析照片……"
+  if ! "$python_bin" "$tool_dir/photo_cull.py" "$photo_dir" "$report_dir" --refresh-only; then
+    if [[ -f "$report_dir/打开查看.html" ]]; then
+      echo "页面更新失败，将打开已有结果；照片和手动筛选记录未被改动。"
+    else
+      echo "没有可打开的筛选页面，请重新启动并选择“重新分析”。"
+      read -k 1 "?按任意键关闭…"
+      exit 1
+    fi
+  fi
+else
+  selected_mode="$(osascript <<'APPLESCRIPT'
 set choices to {"自动识别（推荐）", "通用", "人像", "风景", "夜景", "运动"}
 set picked to choose from list choices with prompt "选择这批照片的筛选策略" default items {"自动识别（推荐）"}
 if picked is false then return "auto"
@@ -50,17 +79,18 @@ return "auto"
 APPLESCRIPT
 )"
 
-echo ""
-echo "正在分析：$photo_dir"
-echo "照片只在本机处理，原文件不会被上传。"
-echo ""
-
-"$python_bin" "$tool_dir/photo_cull.py" "$photo_dir" "$report_dir" --mode "$selected_mode"
-if [[ $? -ne 0 ]]; then
   echo ""
-  echo "分析失败。请检查目录中是否有支持的照片。"
-  read -k 1 "?按任意键关闭…"
-  exit 1
+  echo "正在分析：$photo_dir"
+  echo "照片只在本机处理，原文件不会被上传。"
+  echo ""
+
+  "$python_bin" "$tool_dir/photo_cull.py" "$photo_dir" "$report_dir" --mode "$selected_mode"
+  if [[ $? -ne 0 ]]; then
+    echo ""
+    echo "分析失败。请检查目录中是否有支持的照片。"
+    read -k 1 "?按任意键关闭…"
+    exit 1
+  fi
 fi
 
 port="$("$python_bin" - <<'PY'
@@ -72,10 +102,15 @@ s.close()
 PY
 )"
 
-"$python_bin" "$report_dir/photo_cull_server.py" --report-dir "$report_dir" --source-dir "$photo_dir" --port "$port" &
+"$python_bin" "$tool_dir/photo_cull_server.py" --report-dir "$report_dir" --source-dir "$photo_dir" --port "$port" &
 server_pid=$!
 trap 'kill "$server_pid" 2>/dev/null' EXIT INT TERM
 sleep 1
+if ! kill -0 "$server_pid" 2>/dev/null; then
+  echo "本地服务启动失败，请检查终端中的错误信息。"
+  read -k 1 "?按任意键关闭…"
+  exit 1
+fi
 
 report_url="http://localhost:$port/%E6%89%93%E5%BC%80%E6%9F%A5%E7%9C%8B.html"
 open "$report_url"

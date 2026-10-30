@@ -19,5 +19,11 @@ do
   fi
 done
 
+SHORTCUT_PATH="$HOME/Desktop/拾片.command"
+if [[ ! -e "$SHORTCUT_PATH" && ! -L "$SHORTCUT_PATH" ]]; then
+  ln -s "照片初筛工具/照片初筛工具.command" "$SHORTCUT_PATH"
+fi
+
 printf 'Mac 运行副本已更新：%s\n' "$DEST_DIR"
+printf '桌面启动入口：%s\n' "$SHORTCUT_PATH"
 printf '未删除该目录中的其他文件、编译缓存或照片结果。\n'
