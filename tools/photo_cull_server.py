@@ -25,6 +25,11 @@ from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
+from photo_cull_memory import (DRAFT_FILE, SNAPSHOT_FILE, build_snapshot, delete_rule,
+                               load_memory, load_snapshot, parse_summary, prompt_preferences,
+                               read_json as read_memory_json, save_review, summary_prompt, update_rule,
+                               write_json as write_memory_json)
+
 
 CATEGORY_DIRS = {
     "best": "01_保留",
@@ -36,8 +41,26 @@ RAW_EXTENSIONS = {".arw", ".cr2", ".cr3", ".nef", ".nrw", ".raf", ".dng", ".rw2"
 GROUP_FEEDBACK_FILE = "相似分组反馈.json"
 
 
+def confirmed_snapshot(report_dir: Path) -> dict:
+    snapshot = load_snapshot(report_dir)
+    if snapshot:
+        return snapshot if snapshot.get("active", True) else {}
+    log = read_memory_json(report_dir / "上次整理记录.json", {})
+    if not log.get("active"):
+        return {}
+    report = read_memory_json(report_dir / "初筛数据.json", {})
+    names = {item.get("name") for item in report.get("photos", [])}
+    reverse = {folder: key for key, folder in CATEGORY_DIRS.items()}
+    decisions = {}
+    for move in log.get("moves", []):
+        target = Path(move.get("to", ""))
+        if target.name in names and target.parent.name in reverse:
+            decisions[target.name] = reverse[target.parent.name]
+    return build_snapshot(report_dir, decisions) if names and set(decisions) == names else {}
+
+
 def ai_photo_advice(report_dir: Path, names: list[str], supplied_key: str = "", mode: str = "api",
-                    model: str = "", base_url: str = "") -> dict:
+                    model: str = "", base_url: str = "", custom_prompt: str = "", include_memory: bool = True) -> dict:
     """Analyze only explicitly selected report previews; never change decisions."""
     if mode not in {"api", "compatible", "codex"}:
         raise ValueError("不支持的模型接入方式")
@@ -47,13 +70,20 @@ def ai_photo_advice(report_dir: Path, names: list[str], supplied_key: str = "", 
     by_name = {item["name"]: item for item in data.get("photos", [])}
     if len(set(names)) != len(names) or any(name not in by_name for name in names):
         raise ValueError("选择的照片不在当前报告中")
-    prompt = (
+    prompt = custom_prompt or (
         "你是摄影选片助手。请用中文分析这些照片，结合画面内容、构图、光线、主体、情绪和重复度给出筛选建议。"
         "先给明确结论（单张：保留/待确认/淘汰；多张：优先保留哪张，其他如何处理），再给每张最多两点可见证据，"
         "最后说明你看不清或无法判断的地方。不要把已有算法分数当成事实，不要编造画面细节。"
         "建议只供人工参考，禁止代替用户做决定。以下是文件名及本地初筛参考：\n" +
         "\n".join(f"{name}：{by_name[name].get('score', '—')}分；{by_name[name].get('reason', '')}" for name in names)
     )
+    if include_memory and not custom_prompt:
+        try:
+            preferences = prompt_preferences({by_name[name].get("scene", "general") for name in names})
+        except (OSError, ValueError, json.JSONDecodeError):
+            preferences = ""  # A damaged optional Memory file must not disable photo advice.
+        if preferences:
+            prompt += "\n以下是用户审核过的历史筛选偏好，仅作参考，不能覆盖眼前画面证据：\n" + preferences
     content = [{"type": "input_text", "text": prompt}]
     previews = []
     for name in names:
@@ -121,11 +151,11 @@ def ai_photo_advice(report_dir: Path, names: list[str], supplied_key: str = "", 
                         else {"type": "image_url", "image_url": {"url": part["image_url"]}}
                         for part in content]
         body = json.dumps({"model": model, "messages": [{"role": "user", "content": chat_content}],
-                           "max_tokens": 600}, ensure_ascii=False).encode("utf-8")
+                           "max_tokens": 900 if custom_prompt else 600}, ensure_ascii=False).encode("utf-8")
         endpoint = base_url.rstrip("/") + "/chat/completions"
     else:
         body = json.dumps({"model": model, "input": [{"role": "user", "content": content}],
-                           "max_output_tokens": 600, "store": False,
+                           "max_output_tokens": 900 if custom_prompt else 600, "store": False,
                            **({"reasoning": {"effort": "none"}} if model == "gpt-6-luna" else {})}, ensure_ascii=False).encode("utf-8")
         endpoint = "https://api.openai.com/v1/responses"
     request = Request(endpoint, data=body,
@@ -242,7 +272,13 @@ def launch_photo_directory(source_dir: Path, current_report_dir: Path, update_pr
     if saved_report:
         saved_source, saved_output = saved_report
         update_progress(98, "发现已有筛选结果，正在恢复暂存进度", 0, 0)
-        return start_report_server(saved_output, saved_source, current_report_dir)
+        analyzer = Path(__file__).with_name("photo_cull.py")
+        if analyzer.exists() and (saved_output / "初筛数据.json").exists():
+            result = subprocess.run([sys.executable, str(analyzer), str(saved_source), str(saved_output), "--refresh-only"],
+                                    capture_output=True, text=True, timeout=120)
+            if result.returncode:
+                update_progress(99, "页面更新失败，将打开原有筛选结果", 0, 0)
+        return start_report_server(saved_output, saved_source, Path(__file__).resolve().parent)
     analyzer = current_report_dir / "photo_cull.py"
     if not analyzer.exists():
         desktop_analyzer = Path.home() / "Desktop" / "照片初筛工具" / "photo_cull.py"
@@ -444,6 +480,7 @@ def undo_last_organize(report_dir: Path) -> int:
 def make_handler(report_dir: Path, source_dir: Path):
     switch_jobs: dict[str, dict] = {}
     switch_lock = threading.Lock()
+    memory_lock = threading.Lock()
 
     def update_switch_job(job_id: str, **changes) -> None:
         with switch_lock:
@@ -485,7 +522,7 @@ def make_handler(report_dir: Path, source_dir: Path):
 
         def do_POST(self) -> None:
             route = urlparse(self.path).path
-            if route not in {"/api/organize", "/api/undo", "/api/decisions", "/api/group-feedback", "/api/switch-directory", "/api/ai-advice", "/api/ai-test"}:
+            if route not in {"/api/organize", "/api/undo", "/api/decisions", "/api/group-feedback", "/api/switch-directory", "/api/ai-advice", "/api/ai-test", "/api/memory/summarize", "/api/memory/review", "/api/memory/delete", "/api/memory/update"}:
                 self.send_json(404, {"ok": False, "error": "接口不存在"})
                 return
             try:
@@ -497,6 +534,36 @@ def make_handler(report_dir: Path, source_dir: Path):
                     self.send_json(200, {"ok": True, **ai_photo_advice(report_dir, payload.get("names"), payload.get("api_key", ""), payload.get("mode", "api"), payload.get("model", ""), payload.get("base_url", ""))})
                 elif route == "/api/ai-test":
                     self.send_json(200, {"ok": True, "message": test_ai_connection(payload.get("mode", "api"), payload.get("api_key", ""), payload.get("base_url", ""))})
+                elif route == "/api/memory/summarize":
+                    with memory_lock:
+                        snapshot = confirmed_snapshot(report_dir)
+                        if not snapshot:
+                            raise ValueError("请先确认筛选并整理，再总结本次偏好")
+                        previous = read_memory_json(report_dir / DRAFT_FILE, {})
+                        if previous.get("snapshot_id") == snapshot["id"] and not (previous.get("status") == "parse_error" and payload.get("force") is True):
+                            self.send_json(200, {"ok": True, "draft": previous, "reused": True})
+                        else:
+                            names = [item["name"] for item in snapshot.get("samples", [])]
+                            answer = ai_photo_advice(report_dir, names, payload.get("api_key", ""), payload.get("mode", "api"), payload.get("model", ""), payload.get("base_url", ""), summary_prompt(snapshot), False)
+                            try:
+                                draft = parse_summary(answer["advice"], snapshot)
+                            except (ValueError, json.JSONDecodeError):
+                                draft = {"snapshot_id": snapshot["id"], "created_at": datetime.now().isoformat(timespec="seconds"),
+                                         "status": "parse_error", "rules": [], "raw_response": answer["advice"][:4000]}
+                            write_memory_json(report_dir / DRAFT_FILE, draft)
+                            self.send_json(200, {"ok": True, "draft": draft, "reused": False})
+                elif route == "/api/memory/review":
+                    with memory_lock:
+                        store = save_review(report_dir, payload.get("snapshot_id", ""), payload.get("rules", []))
+                    self.send_json(200, {"ok": True, "memory": store})
+                elif route == "/api/memory/delete":
+                    with memory_lock:
+                        store = delete_rule(payload.get("id", ""))
+                    self.send_json(200, {"ok": True, "memory": store})
+                elif route == "/api/memory/update":
+                    with memory_lock:
+                        store = update_rule(payload.get("id", ""), payload.get("text", ""))
+                    self.send_json(200, {"ok": True, "memory": store})
                 elif route == "/api/switch-directory":
                     selected = choose_photo_directory()
                     if selected is None:
@@ -508,11 +575,26 @@ def make_handler(report_dir: Path, source_dir: Path):
                         threading.Thread(target=run_switch_job, args=(job_id, selected), daemon=True).start()
                         self.send_json(202, {"ok": True, "job": job_id, "source": str(selected), "url": f"/switch-wait?job={job_id}"})
                 elif route == "/api/organize":
-                    counts = organize(source_dir, payload.get("decisions", {}), report_dir)
-                    self.send_json(200, {"ok": True, "counts": counts, "target": str(source_dir / "筛选完成")})
+                    decisions = payload.get("decisions", {})
+                    snapshot = build_snapshot(report_dir, decisions, persist=False)
+                    counts = organize(source_dir, decisions, report_dir)
+                    memory_error = ""
+                    try:
+                        write_memory_json(report_dir / SNAPSHOT_FILE, snapshot)
+                    except Exception as exc:
+                        memory_error = f"文件整理已成功，但偏好候选快照未保存：{exc}"
+                    self.send_json(200, {"ok": True, "counts": counts, "target": str(source_dir / "筛选完成"), "memory_candidates": len(snapshot["samples"]) if not memory_error else 0, "memory_error": memory_error})
                 elif route == "/api/undo":
                     restored = undo_last_organize(report_dir)
-                    self.send_json(200, {"ok": True, "restored": restored})
+                    snapshot = load_snapshot(report_dir)
+                    memory_error = ""
+                    if snapshot:
+                        snapshot["active"] = False
+                        try:
+                            write_memory_json(report_dir / SNAPSHOT_FILE, snapshot)
+                        except Exception as exc:
+                            memory_error = f"照片已恢复，但偏好快照状态未更新：{exc}"
+                    self.send_json(200, {"ok": True, "restored": restored, "memory_error": memory_error})
                 elif route == "/api/group-feedback":
                     feedback = update_group_feedback(report_dir, payload.get("action", ""), payload.get("names", []), payload.get("focus", ""))
                     self.send_json(200, {"ok": True, "feedback": feedback})
@@ -567,6 +649,16 @@ def make_handler(report_dir: Path, source_dir: Path):
                 try:
                     payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"positive_pairs": [], "negative_pairs": [], "single_pairs": [], "history": []}
                     self.send_json(200, {"ok": True, "feedback": payload})
+                except Exception as exc:
+                    self.send_json(400, {"ok": False, "error": str(exc)})
+                return
+            if route == "/api/memory":
+                try:
+                    snapshot = confirmed_snapshot(report_dir)
+                    draft = read_memory_json(report_dir / DRAFT_FILE, {})
+                    if draft.get("snapshot_id") != snapshot.get("id"):
+                        draft = {}
+                    self.send_json(200, {"ok": True, "snapshot": snapshot, "draft": draft, "memory": load_memory()})
                 except Exception as exc:
                     self.send_json(400, {"ok": False, "error": str(exc)})
                 return

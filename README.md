@@ -6,6 +6,7 @@ Repository: `photo-cull`
 基础照片分析在本机或 iPhone 上进行。AI 选片建议由用户手动触发，仅将所选照片的预览图发送给配置的模型供应商。
 
 下一阶段以 Mac 端为主；接手项目请先阅读[项目交接指南](docs/guide/20261030_拾片项目交接指南.md)。
+Mac 版已支持手动总结并审核跨目录选片偏好；详情见 [`tools/README.md`](tools/README.md)。
 
 ## 版本目录
 

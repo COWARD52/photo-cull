@@ -8,6 +8,8 @@ mkdir -p "$DEST_DIR"
 for file in \
   photo_cull.py \
   photo_cull_server.py \
+  photo_cull_memory.py \
+  photo_cull_memory.js \
   photo_cull_vision.swift \
   使用说明.txt \
   分享使用说明.txt \
